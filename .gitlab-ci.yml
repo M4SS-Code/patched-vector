@@ -4,7 +4,7 @@ stages:
 rust:build:
   stage: build
   image:
-    name: rust:1.91-trixie
+    name: rust:1.92-trixie
     entrypoint: ["/usr/bin/env"]
   variables:
     CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
