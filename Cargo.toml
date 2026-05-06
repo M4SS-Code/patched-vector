@@ -44,6 +44,10 @@ required-features = ["vector-api-tests"]
 # compiled via the CI pipeline.
 [profile.release]
 debug = false # Do not include debug symbols in the executable.
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
 
 [profile.bench]
 debug = true
