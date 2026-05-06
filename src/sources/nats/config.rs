@@ -292,7 +292,11 @@ impl NatsSourceConfig {
         let options: async_nats::ConnectOptions = self.try_into().context(ConfigSnafu)?;
 
         let server_addrs = self.parse_server_addresses()?;
-        options.connect(server_addrs).await.context(ConnectSnafu)
+        options
+            .tls_first()
+            .connect(server_addrs)
+            .await
+            .context(ConnectSnafu)
     }
 
     const fn mode(&self) -> NatsMode<'_> {
