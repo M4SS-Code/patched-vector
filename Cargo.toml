@@ -43,6 +43,8 @@ required-features = ["vector-api-tests"]
 debug = false # Do not include debug symbols in the executable.
 codegen-units = 1
 lto = "fat"
+strip = true
+panic = "abort"
 
 [profile.bench]
 debug = true
