@@ -207,7 +207,11 @@ impl NatsSinkConfig {
         options: async_nats::ConnectOptions,
     ) -> Result<async_nats::Client, NatsError> {
         let urls = self.parse_server_addresses()?;
-        options.connect(urls).await.context(ConnectSnafu)
+        options
+            .tls_first()
+            .connect(urls)
+            .await
+            .context(ConnectSnafu)
     }
 
     fn parse_server_addresses(&self) -> Result<Vec<async_nats::ServerAddr>, NatsError> {
