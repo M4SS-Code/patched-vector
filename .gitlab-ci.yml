@@ -13,8 +13,8 @@ rust:build:
     - apt install -y gcc-aarch64-linux-gnu protobuf-compiler
     - rustup target add aarch64-unknown-linux-gnu
   script:
-    - cargo build --release --no-default-features --features sources-journald,sources-docker_logs,sources-nats,transforms-remap,sinks-nats,sinks-loki
-    - cargo build --release --no-default-features --target aarch64-unknown-linux-gnu --features sources-journald,sources-docker_logs,sources-nats,transforms-remap,sinks-nats,sinks-loki
+    - cargo build --release --no-default-features --features sources-journald,sources-docker_logs,sources-nats,sources-http_server,transforms-remap,sinks-nats,sinks-loki,sinks-http,sinks-clickhouse
+    - cargo build --release --no-default-features --target aarch64-unknown-linux-gnu --features sources-journald,sources-docker_logs,sources-nats,sources-http_server,transforms-remap,sinks-nats,sinks-loki,sinks-http,sinks-clickhouse
   artifacts:
     paths:
       - target/release/vector
