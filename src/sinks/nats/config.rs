@@ -1,13 +1,16 @@
-use async_nats::{HeaderMap, header};
 use bytes::Bytes;
-use futures_util::TryFutureExt;
 use snafu::ResultExt;
-use vector_lib::{codecs::JsonSerializerConfig, tls::TlsEnableableConfig};
+use vector_lib::codecs::JsonSerializerConfig;
+use watermelon::{
+    core::{Client, ClientBuilder},
+    jetstream::JetstreamClient,
+    proto::{ServerAddr, Subject},
+};
 
-use super::{ConfigSnafu, ConnectSnafu, NatsError, sink::NatsSink};
+use super::{ConfigSnafu, ConnectSnafu, InvalidSubjectSnafu, NatsError, sink::NatsSink};
 use crate::{
     config::ValidatedSink,
-    nats::{NatsAuthConfig, NatsConfigError, from_tls_auth_config, validate_tls_cert_key_pair},
+    nats::{NatsAuthConfig, client_builder, parse_server_address},
     sinks::{prelude::*, util::service::TowerRequestConfigDefaults},
     template::ConfinementConfig,
 };
@@ -35,17 +38,20 @@ pub struct NatsHeaderConfig {
 }
 
 impl NatsHeaderConfig {
-    pub fn build_headers(&self, event: &Event) -> HeaderMap {
-        let mut headers = HeaderMap::new();
+    pub fn build_headers(&self, event: &Event) -> NatsHeaders {
+        let message_id = self
+            .message_id
+            .as_ref()
+            .and_then(|template| template.render_string(event).ok());
 
-        if let Some(template) = &self.message_id
-            && let Ok(value) = template.render_string(event)
-        {
-            headers.insert(header::NATS_MESSAGE_ID, value.as_str());
-        }
-
-        headers
+        NatsHeaders { message_id }
     }
+}
+
+/// The NATS headers rendered for a single message.
+#[derive(Clone, Debug, Default)]
+pub struct NatsHeaders {
+    pub(super) message_id: Option<String>,
 }
 
 /// Configuration for sending messages using NATS JetStream.
@@ -116,15 +122,14 @@ pub struct NatsSinkConfig {
     /// The URL must take the form of `nats://server:port`.
     /// If the port is not specified it defaults to 4222.
     ///
+    /// Use the `tls://` scheme to connect using TLS-first. With the `nats://`
+    /// scheme the connection is upgraded to TLS if required by the server.
+    ///
     /// [nats_url]: https://docs.nats.io/using-nats/developer/connecting#nats-url
     #[configurable(metadata(docs::examples = "nats://demo.nats.io"))]
     #[configurable(metadata(docs::examples = "nats://127.0.0.1:4242"))]
-    #[configurable(metadata(
-        docs::examples = "nats://localhost:4222,nats://localhost:5222,nats://localhost:6222"
-    ))]
+    #[configurable(metadata(docs::examples = "tls://demo.nats.io"))]
     pub(super) url: String,
-
-    pub(super) tls: Option<TlsEnableableConfig>,
 
     pub(super) auth: Option<NatsAuthConfig>,
 
@@ -159,7 +164,6 @@ impl GenerateConfig for NatsSinkConfig {
             connection_name: "vector".into(),
             encoding: JsonSerializerConfig::default().into(),
             subject: Template::try_from("from.vector").unwrap(),
-            tls: None,
             url: "nats://127.0.0.1:4222".into(),
             request: Default::default(),
             jetstream: JetStreamConfig {
@@ -193,7 +197,7 @@ impl SinkConfig for NatsSinkConfig {
 #[derive(Clone, Debug)]
 pub struct ValidatedNatsSink {
     subject: ConfinedTemplate,
-    server_addresses: Vec<async_nats::ServerAddr>,
+    server_address: ServerAddr,
 }
 
 #[async_trait::async_trait]
@@ -205,16 +209,12 @@ impl ValidatedSink for NatsSinkConfig {
             .subject
             .clone()
             .confine(&self.confinement, Self::NAME, "subject")?;
-        let server_addresses = self.parse_server_addresses()?;
+        let server_address = parse_server_address(&self.url).context(ConfigSnafu)?;
         self.encoding.validate()?;
-
-        if let Some(tls) = &self.tls {
-            validate_tls_cert_key_pair(tls).context(ConfigSnafu)?;
-        }
 
         Ok(ValidatedNatsSink {
             subject,
-            server_addresses,
+            server_address,
         })
     }
 
@@ -225,126 +225,109 @@ impl ValidatedSink for NatsSinkConfig {
     ) -> crate::Result<(VectorSink, Healthcheck)> {
         let ValidatedNatsSink {
             subject,
-            server_addresses,
+            server_address,
         } = validated.clone();
-        let sink = NatsSink::new(self.clone(), subject, server_addresses.clone()).await?;
-        let healthcheck = healthcheck(self.clone(), server_addresses).boxed();
+        let sink = NatsSink::new(self.clone(), subject, server_address.clone()).await?;
+        let healthcheck = healthcheck(self.clone(), server_address).boxed();
         Ok((VectorSink::from_event_streamsink(sink), healthcheck))
     }
 }
 
-impl std::convert::TryFrom<&NatsSinkConfig> for async_nats::ConnectOptions {
-    type Error = NatsConfigError;
-
-    fn try_from(config: &NatsSinkConfig) -> Result<Self, Self::Error> {
-        from_tls_auth_config(&config.connection_name, &config.auth, &config.tls)
-    }
-}
-
 impl NatsSinkConfig {
-    pub(super) async fn connect(
-        &self,
-        options: async_nats::ConnectOptions,
-        server_addresses: Vec<async_nats::ServerAddr>,
-    ) -> Result<async_nats::Client, NatsError> {
-        options
-            .connect(server_addresses)
+    fn client_builder(&self) -> Result<ClientBuilder, NatsError> {
+        client_builder(&self.connection_name, &self.auth).context(ConfigSnafu)
+    }
+
+    pub(super) async fn connect(&self, server_address: ServerAddr) -> Result<Client, NatsError> {
+        self.client_builder()?
+            .connect(server_address)
             .await
             .context(ConnectSnafu)
     }
 
-    pub(super) fn parse_server_addresses(&self) -> Result<Vec<async_nats::ServerAddr>, NatsError> {
-        self.url
-            .split(',')
-            .map(|url| {
-                url.parse::<async_nats::ServerAddr>()
-                    .map_err(|_| NatsError::Connect {
-                        source: async_nats::ConnectErrorKind::ServerParse.into(),
-                    })
-            })
-            .collect()
-    }
-
-    #[cfg(not(test))]
-    fn create_connect_options(&self) -> Result<async_nats::ConnectOptions, NatsError> {
-        let mut options: async_nats::ConnectOptions = self.try_into().context(ConfigSnafu)?;
-        options = options.retry_on_initial_connect();
-        Ok(options)
-    }
-
-    #[cfg(test)]
-    fn create_connect_options(&self) -> Result<async_nats::ConnectOptions, NatsError> {
-        let options: async_nats::ConnectOptions = self.try_into().context(ConfigSnafu)?;
-        Ok(options)
+    async fn create_client(&self, server_address: ServerAddr) -> Result<Client, NatsError> {
+        if cfg!(test) {
+            self.connect(server_address).await
+        } else {
+            // Keep retrying the initial connection in the background.
+            Ok(self.client_builder()?.connect_lazy(server_address))
+        }
     }
 
     pub(super) async fn publisher(
         &self,
-        server_addresses: Vec<async_nats::ServerAddr>,
+        server_address: ServerAddr,
     ) -> Result<NatsPublisher, NatsError> {
-        let options = self.create_connect_options()?;
-        let connection = self.connect(options, server_addresses).await?;
+        let connection = self.create_client(server_address).await?;
 
         if self.jetstream.enabled {
-            Ok(NatsPublisher::JetStream(async_nats::jetstream::new(
-                connection,
-            )))
+            Ok(NatsPublisher::JetStream(JetstreamClient::new(connection)))
         } else {
             Ok(NatsPublisher::Core(connection))
         }
     }
 }
 
-async fn healthcheck(
-    config: NatsSinkConfig,
-    server_addresses: Vec<async_nats::ServerAddr>,
-) -> crate::Result<()> {
-    let options: async_nats::ConnectOptions = (&config).try_into().context(ConfigSnafu)?;
-    config
-        .connect(options, server_addresses)
-        .map_ok(|_| ())
-        .map_err(|e| e.into())
-        .await
+async fn healthcheck(config: NatsSinkConfig, server_address: ServerAddr) -> crate::Result<()> {
+    config.connect(server_address).await?.close().await;
+    Ok(())
 }
 
 pub enum NatsPublisher {
-    Core(async_nats::Client),
-    JetStream(async_nats::jetstream::Context),
+    Core(Client),
+    JetStream(JetstreamClient),
 }
 
 impl NatsPublisher {
-    pub(super) async fn publish<S: async_nats::subject::ToSubject>(
+    /// Gracefully close the connection, flushing any buffered messages.
+    pub(super) async fn close(&self) {
+        let client = match self {
+            NatsPublisher::Core(client) => client,
+            NatsPublisher::JetStream(jetstream) => jetstream.client(),
+        };
+
+        // `Client::close` drops the commands that are still queued in the client
+        // and stalls until the connection times out. The server only replies to a
+        // request after having processed every previous publish, so wait for one
+        // to round-trip first. Nobody is expected to respond to it.
+        if let Ok(response) = client
+            .request(Subject::from_static("_VECTOR.flush"))
+            .payload(Bytes::new())
+            .await
+        {
+            drop(response.await);
+        }
+        client.close().await;
+    }
+
+    pub(super) async fn publish(
         &self,
-        subject: S,
-        headers: HeaderMap,
+        subject: String,
+        headers: NatsHeaders,
         payload: Bytes,
     ) -> Result<(), NatsError> {
+        let subject = Subject::try_from(subject).context(InvalidSubjectSnafu)?;
+
         match self {
             NatsPublisher::Core(client) => {
-                client
-                    .publish(subject, payload)
-                    .await
-                    .map_err(|e| NatsError::PublishError {
+                client.publish(subject).payload(payload).await.map_err(|e| {
+                    NatsError::PublishError {
                         source: Box::new(e),
-                    })?;
-                client
-                    .flush()
-                    .map_ok(|_| ())
+                    }
+                })
+            }
+            NatsPublisher::JetStream(jetstream) => {
+                let mut publish = jetstream.publish(subject);
+                if let Some(message_id) = &headers.message_id {
+                    publish = publish.message_id(message_id);
+                }
+                publish
+                    .payload(payload)
+                    .await
+                    .map(|_| ())
                     .map_err(|e| NatsError::PublishError {
                         source: Box::new(e),
                     })
-                    .await
-            }
-            NatsPublisher::JetStream(jetstream) => {
-                let ack = jetstream
-                    .publish_with_headers(subject, headers, payload)
-                    .await
-                    .map_err(|e| NatsError::PublishError {
-                        source: Box::new(e),
-                    })?;
-                ack.await.map(|_| ()).map_err(|e| NatsError::PublishError {
-                    source: Box::new(e),
-                })
             }
         }
     }
@@ -374,7 +357,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_accepts_comma_separated_urls() {
+    fn validate_rejects_comma_separated_urls() {
         let config: NatsSinkConfig = serde_yaml::from_str(
             r#"
             subject: "test-subject"
@@ -385,8 +368,8 @@ mod tests {
         )
         .unwrap();
         assert!(
-            config.validate().is_ok(),
-            "a comma-separated list of valid urls should pass validation"
+            config.validate().is_err(),
+            "a comma-separated list of urls is not supported"
         );
     }
 
@@ -403,87 +386,6 @@ mod tests {
         .unwrap();
         let validated = config.validate().expect("validation should succeed");
         assert_eq!(validated.subject.to_string(), "test-subject");
-    }
-
-    #[test]
-    fn validate_rejects_tls_cert_without_key() {
-        let config: NatsSinkConfig = serde_yaml::from_str(
-            r#"
-            subject: "test-subject"
-            url: "nats://127.0.0.1:4222"
-            encoding:
-                codec: "json"
-            tls:
-                enabled: true
-                crt_file: "/path/to/crt.pem"
-            "#,
-        )
-        .unwrap();
-        assert!(
-            config.validate().is_err(),
-            "a TLS cert without a key should fail validation"
-        );
-    }
-
-    #[test]
-    fn validate_rejects_tls_key_without_cert() {
-        let config: NatsSinkConfig = serde_yaml::from_str(
-            r#"
-            subject: "test-subject"
-            url: "nats://127.0.0.1:4222"
-            encoding:
-                codec: "json"
-            tls:
-                enabled: true
-                key_file: "/path/to/key.pem"
-            "#,
-        )
-        .unwrap();
-        assert!(
-            config.validate().is_err(),
-            "a TLS key without a cert should fail validation"
-        );
-    }
-
-    #[test]
-    fn validate_accepts_tls_cert_and_key() {
-        let config: NatsSinkConfig = serde_yaml::from_str(
-            r#"
-            subject: "test-subject"
-            url: "nats://127.0.0.1:4222"
-            encoding:
-                codec: "json"
-            tls:
-                enabled: true
-                crt_file: "/path/to/crt.pem"
-                key_file: "/path/to/key.pem"
-            "#,
-        )
-        .unwrap();
-        assert!(
-            config.validate().is_ok(),
-            "a complete TLS cert/key pair should pass validation"
-        );
-    }
-
-    #[test]
-    fn validate_accepts_disabled_tls_with_partial_config() {
-        let config: NatsSinkConfig = serde_yaml::from_str(
-            r#"
-            subject: "test-subject"
-            url: "nats://127.0.0.1:4222"
-            encoding:
-                codec: "json"
-            tls:
-                enabled: false
-                crt_file: "/path/to/crt.pem"
-            "#,
-        )
-        .unwrap();
-        assert!(
-            config.validate().is_ok(),
-            "disabled TLS should not fail validation on a lone cert"
-        );
     }
 
     #[test]

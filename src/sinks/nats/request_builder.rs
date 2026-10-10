@@ -1,11 +1,13 @@
 use std::io;
 
-use async_nats::HeaderMap;
 use bytes::{Bytes, BytesMut};
 use tokio_util::codec::Encoder as _;
 use vector_lib::config::telemetry;
 
-use super::{config::NatsHeaderConfig, sink::NatsEvent};
+use super::{
+    config::{NatsHeaderConfig, NatsHeaders},
+    sink::NatsEvent,
+};
 use crate::sinks::prelude::*;
 
 pub(super) struct NatsEncoder {
@@ -39,7 +41,7 @@ impl encoding::Encoder<Event> for NatsEncoder {
 
 pub(super) struct NatsMetadata {
     subject: String,
-    headers: HeaderMap,
+    headers: NatsHeaders,
     finalizers: EventFinalizers,
 }
 
@@ -52,7 +54,7 @@ pub(super) struct NatsRequestBuilder {
 pub(super) struct NatsRequest {
     pub(super) bytes: Bytes,
     pub(super) subject: String,
-    pub(super) headers: HeaderMap,
+    pub(super) headers: NatsHeaders,
     finalizers: EventFinalizers,
     pub(super) metadata: RequestMetadata,
 }

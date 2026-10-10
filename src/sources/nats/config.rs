@@ -1,6 +1,3 @@
-use async_nats::jetstream::{
-    consumer::StreamError as ConsumerStreamError, context::GetStreamError,
-};
 use snafu::{ResultExt, Snafu};
 use vector_lib::{
     codecs::decoding::{DeserializerConfig, FramingConfig},
@@ -9,11 +6,15 @@ use vector_lib::{
     lookup::{lookup_v2::OptionalValuePath, owned_value_path},
 };
 use vrl::value::Kind;
+use watermelon::{
+    core::{Client, error::ConnectHandlerError},
+    jetstream::error::JetstreamError,
+};
 
 use crate::{
     codecs::DecodingConfig,
     config::{GenerateConfig, SourceConfig, SourceContext, SourceOutput},
-    nats::{NatsAuthConfig, NatsConfigError, from_tls_auth_config},
+    nats::{NatsAuthConfig, NatsConfigError, client_builder, parse_server_address},
     serde::{default_decoding, default_framing_message_based},
     sources::{
         Source,
@@ -21,7 +22,6 @@ use crate::{
             create_consumer_stream, create_subscription, run_nats_core, run_nats_jetstream,
         },
     },
-    tls::TlsEnableableConfig,
 };
 
 #[derive(Debug, Snafu)]
@@ -30,50 +30,45 @@ pub enum BuildError {
     #[snafu(display("NATS Config Error: {}", source))]
     Config { source: NatsConfigError },
     #[snafu(display("NATS Connect Error: {}", source))]
-    Connect { source: async_nats::ConnectError },
+    Connect { source: ConnectHandlerError },
     #[snafu(display("NATS Subscribe Error: {}", source))]
-    Subscribe { source: async_nats::SubscribeError },
-    #[snafu(display("NATS stream not found: {}", source))]
-    Stream { source: GetStreamError },
+    Subscribe {
+        source: watermelon::core::error::ClientClosedError,
+    },
+    #[snafu(display("Invalid NATS subject: {}", source))]
+    InvalidSubject {
+        source: watermelon::proto::error::SubjectValidateError,
+    },
+    #[snafu(display("Invalid NATS queue group: {}", source))]
+    InvalidQueueGroup {
+        source: watermelon::proto::error::QueueGroupValidateError,
+    },
     #[snafu(display("Failed to get NATS consumer: {}", source))]
-    Consumer { source: async_nats::Error },
-    #[snafu(display("Failed to retrieve messages from NATS consumer: {}", source))]
-    Messages { source: ConsumerStreamError },
+    Consumer { source: JetstreamError },
+    #[snafu(display("NATS consumer {} not found in stream {}", consumer, stream))]
+    ConsumerNotFound { stream: String, consumer: String },
 }
 
 /// Batch settings for a JetStream pull consumer.
 ///
 /// By default, messages are pulled in batches of up to 200.
 /// Each pull request expires after 30 seconds if not fulfilled.
-/// There is no explicit maximum byte size per batch unless specified.
-///
-/// **Note:** These defaults follow the `async-nats` crate’s `StreamBuilder`.
 #[configurable_component]
 #[derive(Clone, Debug)]
 pub(super) struct BatchConfig {
     /// The maximum number of messages to pull in a single batch.
     #[serde(default = "default_batch")]
     pub(super) batch: usize,
-
-    /// The maximum total byte size for a batch. The pull request will be
-    /// fulfilled when either `size` or `max_bytes` is reached.
-    #[serde(default = "default_max_bytes")]
-    pub(super) max_bytes: usize,
 }
 
 const fn default_batch() -> usize {
     200
 }
 
-const fn default_max_bytes() -> usize {
-    0
-}
-
 impl Default for BatchConfig {
     fn default() -> Self {
         Self {
             batch: default_batch(),
-            max_bytes: default_max_bytes(),
         }
     }
 }
@@ -104,11 +99,12 @@ pub struct NatsSourceConfig {
     ///
     /// The URL takes the form of `nats://server:port`.
     /// If the port is not specified it defaults to 4222.
+    ///
+    /// Use the `tls://` scheme to connect using TLS-first. With the `nats://`
+    /// scheme the connection is upgraded to TLS if required by the server.
     #[configurable(metadata(docs::examples = "nats://demo.nats.io"))]
     #[configurable(metadata(docs::examples = "nats://127.0.0.1:4242"))]
-    #[configurable(metadata(
-        docs::examples = "nats://localhost:4222,nats://localhost:5222,nats://localhost:6222"
-    ))]
+    #[configurable(metadata(docs::examples = "tls://demo.nats.io"))]
     pub url: String,
 
     /// A [name][nats_connection_name] assigned to the NATS connection.
@@ -136,8 +132,6 @@ pub struct NatsSourceConfig {
     #[serde(default)]
     pub log_namespace: Option<bool>,
 
-    pub tls: Option<TlsEnableableConfig>,
-
     pub auth: Option<NatsAuthConfig>,
 
     #[serde(default = "default_framing_message_based")]
@@ -152,28 +146,12 @@ pub struct NatsSourceConfig {
     #[serde(default = "default_subject_key_field")]
     pub subject_key_field: OptionalValuePath,
 
-    /// The buffer capacity of the underlying NATS subscriber.
-    ///
-    /// This value determines how many messages the NATS subscriber buffers
-    /// before incoming messages are dropped.
-    ///
-    /// See the [async_nats documentation][async_nats_subscription_capacity] for more information.
-    ///
-    /// [async_nats_subscription_capacity]: https://docs.rs/async-nats/latest/async_nats/struct.ConnectOptions.html#method.subscription_capacity
-    #[serde(default = "default_subscription_capacity")]
-    #[derivative(Default(value = "default_subscription_capacity()"))]
-    pub subscriber_capacity: usize,
-
     #[serde(default)]
     pub jetstream: Option<JetStreamConfig>,
 }
 
 pub fn default_subject_key_field() -> OptionalValuePath {
     OptionalValuePath::from(owned_value_path!("subject"))
-}
-
-pub const fn default_subscription_capacity() -> usize {
-    65536
 }
 
 impl GenerateConfig for NatsSourceConfig {
@@ -265,11 +243,10 @@ enum NatsMode<'a> {
 }
 
 impl NatsSourceConfig {
-    pub async fn connect(&self) -> Result<async_nats::Client, BuildError> {
-        let options: async_nats::ConnectOptions = self.try_into().context(ConfigSnafu)?;
-
-        let server_addrs = self.parse_server_addresses()?;
-        options.connect(server_addrs).await.context(ConnectSnafu)
+    pub async fn connect(&self) -> Result<Client, BuildError> {
+        let builder = client_builder(&self.connection_name, &self.auth).context(ConfigSnafu)?;
+        let server_addr = parse_server_address(&self.url).context(ConfigSnafu)?;
+        builder.connect(server_addr).await.context(ConnectSnafu)
     }
 
     const fn mode(&self) -> NatsMode<'_> {
@@ -277,27 +254,6 @@ impl NatsSourceConfig {
             Some(config) => NatsMode::JetStream(config),
             None => NatsMode::Core,
         }
-    }
-
-    fn parse_server_addresses(&self) -> Result<Vec<async_nats::ServerAddr>, BuildError> {
-        self.url
-            .split(',')
-            .map(|url| {
-                url.parse::<async_nats::ServerAddr>()
-                    .map_err(|_| BuildError::Connect {
-                        source: async_nats::ConnectErrorKind::ServerParse.into(),
-                    })
-            })
-            .collect()
-    }
-}
-
-impl TryFrom<&NatsSourceConfig> for async_nats::ConnectOptions {
-    type Error = NatsConfigError;
-
-    fn try_from(config: &NatsSourceConfig) -> Result<Self, Self::Error> {
-        from_tls_auth_config(&config.connection_name, &config.auth, &config.tls)
-            .map(|options| options.subscription_capacity(config.subscriber_capacity))
     }
 }
 

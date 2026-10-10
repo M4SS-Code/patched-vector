@@ -3,8 +3,6 @@ use std::{
     task::{Context, Poll},
 };
 
-use futures_util::TryFutureExt;
-
 use super::{NatsError, config::NatsPublisher, request_builder::NatsRequest};
 use crate::sinks::prelude::*;
 
@@ -46,16 +44,12 @@ impl Service<NatsRequest> for NatsService {
         let publisher = Arc::clone(&self.publisher);
 
         Box::pin(async move {
-            match publisher
+            publisher
                 .publish(req.subject, req.headers, req.bytes)
-                .map_err(async_nats::Error::from)
-                .await
-            {
-                Err(error) => Err(NatsError::ServerError { source: error }),
-                Ok(_) => Ok(NatsResponse {
-                    metadata: req.metadata,
-                }),
-            }
+                .await?;
+            Ok(NatsResponse {
+                metadata: req.metadata,
+            })
         })
     }
 }

@@ -44,9 +44,9 @@ impl NatsSink {
     pub(super) async fn new(
         config: NatsSinkConfig,
         subject: ConfinedTemplate,
-        server_addresses: Vec<async_nats::ServerAddr>,
+        server_address: watermelon::proto::ServerAddr,
     ) -> Result<Self, NatsError> {
-        let publisher = Arc::new(config.publisher(server_addresses).await?);
+        let publisher = Arc::new(config.publisher(server_address).await?);
         let transformer = config.encoding.transformer();
         let serializer = config.encoding.build().context(EncodingSnafu)?;
         let encoder = Encoder::<()>::new(serializer);
@@ -80,7 +80,7 @@ impl NatsSink {
                 publisher: Arc::clone(&self.publisher),
             });
 
-        input
+        let result = input
             .filter_map(|event| std::future::ready(self.make_nats_event(event)))
             .request_builder(default_request_builder_concurrency_limit(), request_builder)
             .filter_map(|request| async move {
@@ -95,7 +95,13 @@ impl NatsSink {
             .into_driver(service)
             .protocol("nats")
             .run()
-            .await
+            .await;
+
+        // Dropping the client would abort the connection, losing any
+        // buffered publishes. Close it gracefully instead.
+        self.publisher.close().await;
+
+        result
     }
 }
 

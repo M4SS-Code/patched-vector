@@ -1,15 +1,23 @@
 #![allow(clippy::print_stdout)]
-use async_nats::jetstream::stream::StorageType;
+use std::{collections::BTreeMap, num::NonZero, time::Duration};
+
 use bytes::Bytes;
 use vector_lib::config::log_schema;
+use watermelon::{
+    core::Client,
+    jetstream::{
+        AckPolicy, ConsumerConfig, ConsumerDurability, ConsumerSpecificConfig, ConsumerStorage,
+        DeliverPolicy, DiscardPolicy, JetstreamClient, ReplayPolicy, Storage, StreamConfig,
+    },
+    proto::Subject,
+};
+use watermelon_testkit::NatsServer;
 
 use crate::{
     SourceSender,
     codecs::DecodingConfig,
     config::{LogNamespace, SourceConfig, SourceContext},
-    nats::{
-        NatsAuthConfig, NatsAuthCredentialsFile, NatsAuthNKey, NatsAuthToken, NatsAuthUserPassword,
-    },
+    nats::{NatsAuthConfig, NatsAuthCredentialsFile, NatsAuthUserPassword},
     serde::{default_decoding, default_framing_message_based},
     shutdown::ShutdownSignal,
     sources::nats::{
@@ -21,8 +29,126 @@ use crate::{
         components::{SOURCE_TAGS, assert_source_compliance},
         random_string,
     },
-    tls::{TlsConfig, TlsEnableableConfig},
 };
+
+/// Starts a disposable `nats-server`, or returns from the test if it isn't installed.
+macro_rules! start_server {
+    ($builder:expr) => {
+        match $builder.start().await {
+            Some(server) => server,
+            None => return,
+        }
+    };
+}
+
+/// The `nats-server` configuration for JWT authentication, without TLS.
+fn jwt_server_config() -> String {
+    let config = std::fs::read_to_string("tests/integration/nats/data/nats-jwt.conf")
+        .expect("Failed to read the JWT server configuration");
+    let (config, _tls) = config
+        .split_once("\ntls:")
+        .expect("Missing the TLS block in the JWT server configuration");
+    config.to_owned()
+}
+
+fn stream_config(name: &str, subject: &str) -> StreamConfig {
+    StreamConfig {
+        name: name.to_owned(),
+        subjects: vec![subject.parse().unwrap()],
+        max_consumers: None,
+        max_messages: None,
+        max_bytes: None,
+        max_age: Duration::ZERO,
+        max_messages_per_subject: None,
+        max_message_size: None,
+        discard_policy: DiscardPolicy::Old,
+        storage: Storage::Memory,
+        replicas: NonZero::new(1).unwrap(),
+        duplicate_window: Duration::from_secs(120),
+        compression: None,
+        allow_direct: false,
+        mirror_direct: false,
+        sealed: false,
+        allow_delete: true,
+        allow_purge: true,
+        allow_rollup_hdrs: false,
+    }
+}
+
+fn consumer_config(name: &str) -> ConsumerConfig {
+    ConsumerConfig {
+        durability: ConsumerDurability::Durable,
+        name: name.to_owned(),
+        description: String::new(),
+        deliver_policy: DeliverPolicy::All,
+        ack_policy: AckPolicy::Explicit {
+            wait: Duration::from_secs(30),
+            max_pending: None,
+        },
+        max_deliver: None,
+        backoff: Vec::new(),
+        filter_subjects: Vec::new(),
+        replay_policy: ReplayPolicy::Instant,
+        rate_limit: None,
+        headers_only: false,
+        specs: ConsumerSpecificConfig::Pull {
+            max_waiting: None,
+            max_request_batch: None,
+            max_request_expires: Duration::ZERO,
+            max_request_max_bytes: None,
+        },
+        inactive_threshold: Duration::ZERO,
+        replicas: None,
+        storage: ConsumerStorage::Memory,
+        metadata: BTreeMap::new(),
+    }
+}
+
+async fn connect(url: &str) -> Client {
+    Client::builder()
+        .connect(url.parse().unwrap())
+        .await
+        .expect("Failed to connect to NATS")
+}
+
+/// Waits for the server to process every command previously sent by `client`.
+async fn sync(client: &Client) {
+    // Nobody responds to this subject, but the server only replies after
+    // having processed all of the previous commands sent by this client.
+    let response = client
+        .request(Subject::from_static("_VECTOR_TEST.sync"))
+        .payload(Bytes::new())
+        .await
+        .unwrap();
+    drop(response.await);
+}
+
+async fn publish(client: &Client, subject: &str, payload: &'static [u8]) {
+    client
+        .publish(subject.parse().unwrap())
+        .payload(Bytes::from_static(payload))
+        .await
+        .unwrap();
+}
+
+async fn create_stream(js: &JetstreamClient, stream_name: &str, subject: &str) {
+    js.create_stream(&stream_config(stream_name, subject))
+        .await
+        .expect("Failed to create stream");
+}
+
+async fn create_consumer(js: &JetstreamClient, stream_name: &str, consumer_name: &str) {
+    js.create_consumer(stream_name, &consumer_config(consumer_name))
+        .await
+        .expect("Failed to create consumer");
+}
+
+async fn js_publish(js: &JetstreamClient, subject: &str, payload: Bytes) {
+    js.publish(subject.parse().unwrap())
+        .payload(payload)
+        .await
+        .expect("Failed to publish to JetStream");
+}
 
 /// Generates a random test identifier safe for use as a NATS subject,
 /// stream name, and consumer name (alphanumeric + underscores only).
@@ -54,31 +180,12 @@ async fn run_jetstream_test(conf: NatsSourceConfig) -> Result<(), crate::Error> 
     let msg = "my jetstream message";
 
     // Connect to NATS and set up the JetStream stream and consumer.
-    let client = async_nats::connect(conf.url.clone())
-        .await
-        .expect("Failed to connect to NATS");
-    let js = async_nats::jetstream::new(client.clone());
-
-    js.get_or_create_stream(async_nats::jetstream::stream::Config {
-        name: js_config.stream.clone(),
-        subjects: vec![subject.clone()],
-        storage: StorageType::Memory,
-        ..Default::default()
-    })
-    .await
-    .expect("Failed to create stream");
-
-    let stream = js.get_stream(js_config.stream).await.unwrap();
-    stream
-        .create_consumer(async_nats::jetstream::consumer::pull::Config {
-            durable_name: Some(js_config.consumer),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
+    let js = JetstreamClient::new(connect(&conf.url).await);
+    create_stream(&js, &js_config.stream, &subject).await;
+    create_consumer(&js, &js_config.stream, &js_config.consumer).await;
 
     // Publish a message for the source to consume.
-    js.publish(subject, msg.as_bytes().into()).await.unwrap();
+    js_publish(&js, &subject, Bytes::from_static(msg.as_bytes())).await;
 
     // Run the source and verify it receives the event.
     let events = assert_source_compliance(&SOURCE_TAGS, async move {
@@ -103,8 +210,13 @@ async fn run_jetstream_test(conf: NatsSourceConfig) -> Result<(), crate::Error> 
 async fn publish_and_check(conf: NatsSourceConfig) -> Result<(), BuildError> {
     let subject = conf.subject.clone();
     let (nc, sub) = create_subscription(&conf).await?;
-    let nc_pub = nc.clone();
+    // Messages published by the subscribing client aren't echoed back to it,
+    // so publish them from a separate connection.
+    let nc_pub = conf.connect().await?;
     let msg = "my message";
+
+    // Make sure the subscription is active before publishing.
+    sync(&nc).await;
 
     let events = assert_source_compliance(&SOURCE_TAGS, async move {
         let (tx, rx) = SourceSender::new_test();
@@ -124,10 +236,7 @@ async fn publish_and_check(conf: NatsSourceConfig) -> Result<(), BuildError> {
             ShutdownSignal::noop(),
             tx,
         ));
-        nc_pub
-            .publish(subject, Bytes::from_static(msg.as_bytes()))
-            .await
-            .unwrap();
+        publish(&nc_pub, &subject, msg.as_bytes()).await;
 
         collect_n(rx, 1).await
     })
@@ -144,8 +253,8 @@ async fn publish_and_check(conf: NatsSourceConfig) -> Result<(), BuildError> {
 #[tokio::test]
 async fn nats_no_auth() {
     let subject = format!("test-{}", random_string(10));
-    let url =
-        std::env::var("NATS_ADDRESS").unwrap_or_else(|_| String::from("nats://localhost:4222"));
+    let server = start_server!(NatsServer::builder());
+    let url = server.client_url().to_owned();
 
     let conf = generate_source_config(&url, &subject);
 
@@ -159,8 +268,8 @@ async fn nats_no_auth() {
 #[tokio::test]
 async fn nats_userpass_auth_valid() {
     let subject = format!("test-{}", random_string(10));
-    let url = std::env::var("NATS_USERPASS_ADDRESS")
-        .unwrap_or_else(|_| String::from("nats://localhost:4222"));
+    let server = start_server!(NatsServer::builder().user("natsuser", "natspass"));
+    let url = server.client_url().to_owned();
 
     let mut conf = generate_source_config(&url, &subject);
     conf.auth = Some(NatsAuthConfig::UserPassword {
@@ -180,8 +289,8 @@ async fn nats_userpass_auth_valid() {
 #[tokio::test]
 async fn nats_userpass_auth_invalid() {
     let subject = format!("test-{}", random_string(10));
-    let url = std::env::var("NATS_USERPASS_ADDRESS")
-        .unwrap_or_else(|_| String::from("nats://localhost:4222"));
+    let server = start_server!(NatsServer::builder().user("natsuser", "natspass"));
+    let url = server.client_url().to_owned();
 
     let mut conf = generate_source_config(&url, &subject);
     conf.auth = Some(NatsAuthConfig::UserPassword {
@@ -199,184 +308,12 @@ async fn nats_userpass_auth_invalid() {
 }
 
 #[tokio::test]
-async fn nats_token_auth_valid() {
+async fn nats_credentials_file_auth_valid() {
     let subject = format!("test-{}", random_string(10));
-    let url = std::env::var("NATS_TOKEN_ADDRESS")
-        .unwrap_or_else(|_| String::from("nats://localhost:4222"));
+    let server = start_server!(NatsServer::builder().config(jwt_server_config()));
+    let url = server.client_url().to_owned();
 
     let mut conf = generate_source_config(&url, &subject);
-    conf.auth = Some(NatsAuthConfig::Token {
-        token: NatsAuthToken {
-            value: "secret".to_string().into(),
-        },
-    });
-
-    let r = publish_and_check(conf).await;
-    assert!(
-        r.is_ok(),
-        "publish_and_check failed, expected Ok(()), got: {r:?}"
-    );
-}
-
-#[tokio::test]
-async fn nats_token_auth_invalid() {
-    let subject = format!("test-{}", random_string(10));
-    let url = std::env::var("NATS_TOKEN_ADDRESS")
-        .unwrap_or_else(|_| String::from("nats://localhost:4222"));
-
-    let mut conf = generate_source_config(&url, &subject);
-    conf.auth = Some(NatsAuthConfig::Token {
-        token: NatsAuthToken {
-            value: "wrongsecret".to_string().into(),
-        },
-    });
-
-    let r = publish_and_check(conf).await;
-    assert!(
-        matches!(r, Err(BuildError::Connect { .. })),
-        "publish_and_check failed, expected BuildError::Connect, got: {r:?}"
-    );
-}
-
-#[tokio::test]
-async fn nats_nkey_auth_valid() {
-    let subject = format!("test-{}", random_string(10));
-    let url = std::env::var("NATS_NKEY_ADDRESS")
-        .unwrap_or_else(|_| String::from("nats://localhost:4222"));
-
-    let mut conf = generate_source_config(&url, &subject);
-    conf.auth = Some(NatsAuthConfig::Nkey {
-        nkey: NatsAuthNKey {
-            nkey: "UD345ZYSUJQD7PNCTWQPINYSO3VH4JBSADBSYUZOBT666DRASFRAWAWT".into(),
-            seed: "SUANIRXEZUROTXNFN3TJYMT27K7ZZVMD46FRIHF6KXKS4KGNVBS57YAFGY".into(),
-        },
-    });
-
-    let r = publish_and_check(conf).await;
-    assert!(
-        r.is_ok(),
-        "publish_and_check failed, expected Ok(()), got: {r:?}"
-    );
-}
-
-#[tokio::test]
-async fn nats_nkey_auth_invalid() {
-    let subject = format!("test-{}", random_string(10));
-    let url = std::env::var("NATS_NKEY_ADDRESS")
-        .unwrap_or_else(|_| String::from("nats://localhost:4222"));
-
-    let mut conf = generate_source_config(&url, &subject);
-    conf.auth = Some(NatsAuthConfig::Nkey {
-        nkey: NatsAuthNKey {
-            nkey: "UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
-            seed: "SBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".into(),
-        },
-    });
-
-    let r = publish_and_check(conf).await;
-    assert!(
-        matches!(r, Err(BuildError::Connect { .. })),
-        "publish_and_check failed, expected BuildError::Config, got: {r:?}"
-    );
-}
-
-#[tokio::test]
-async fn nats_tls_valid() {
-    let subject = format!("test-{}", random_string(10));
-    let url =
-        std::env::var("NATS_TLS_ADDRESS").unwrap_or_else(|_| String::from("nats://localhost:4222"));
-
-    let mut conf = generate_source_config(&url, &subject);
-    conf.tls = Some(TlsEnableableConfig {
-        enabled: Some(true),
-        options: TlsConfig {
-            ca_file: Some("tests/integration/nats/data/rootCA.pem".into()),
-            ..Default::default()
-        },
-    });
-
-    let r = publish_and_check(conf).await;
-    assert!(
-        r.is_ok(),
-        "publish_and_check failed, expected Ok(()), got: {r:?}"
-    );
-}
-
-#[tokio::test]
-async fn nats_tls_invalid() {
-    let subject = format!("test-{}", random_string(10));
-    let url =
-        std::env::var("NATS_TLS_ADDRESS").unwrap_or_else(|_| String::from("nats://localhost:4222"));
-
-    let conf = generate_source_config(&url, &subject);
-
-    let r = publish_and_check(conf).await;
-    assert!(
-        matches!(r, Err(BuildError::Connect { .. })),
-        "publish_and_check failed, expected BuildError::Connect, got: {r:?}"
-    );
-}
-
-#[tokio::test]
-async fn nats_tls_client_cert_valid() {
-    let subject = format!("test-{}", random_string(10));
-    let url = std::env::var("NATS_TLS_CLIENT_CERT_ADDRESS")
-        .unwrap_or_else(|_| String::from("nats://localhost:4222"));
-
-    let mut conf = generate_source_config(&url, &subject);
-    conf.tls = Some(TlsEnableableConfig {
-        enabled: Some(true),
-        options: TlsConfig {
-            ca_file: Some("tests/integration/nats/data/rootCA.pem".into()),
-            crt_file: Some("tests/integration/nats/data/nats-client.pem".into()),
-            key_file: Some("tests/integration/nats/data/nats-client.key".into()),
-            ..Default::default()
-        },
-    });
-
-    let r = publish_and_check(conf).await;
-    assert!(
-        r.is_ok(),
-        "publish_and_check failed, expected Ok(()), got: {r:?}"
-    );
-}
-
-#[tokio::test]
-async fn nats_tls_client_cert_invalid() {
-    let subject = format!("test-{}", random_string(10));
-    let url = std::env::var("NATS_TLS_CLIENT_CERT_ADDRESS")
-        .unwrap_or_else(|_| String::from("nats://localhost:4222"));
-
-    let mut conf = generate_source_config(&url, &subject);
-    conf.tls = Some(TlsEnableableConfig {
-        enabled: Some(true),
-        options: TlsConfig {
-            ca_file: Some("tests/integration/nats/data/rootCA.pem".into()),
-            ..Default::default()
-        },
-    });
-
-    let r = publish_and_check(conf).await;
-    assert!(
-        matches!(r, Err(BuildError::Connect { .. })),
-        "publish_and_check failed, expected BuildError::Connect, got: {r:?}"
-    );
-}
-
-#[tokio::test]
-async fn nats_tls_jwt_auth_valid() {
-    let subject = format!("test-{}", random_string(10));
-    let url =
-        std::env::var("NATS_JWT_ADDRESS").unwrap_or_else(|_| String::from("nats://localhost:4222"));
-
-    let mut conf = generate_source_config(&url, &subject);
-    conf.tls = Some(TlsEnableableConfig {
-        enabled: Some(true),
-        options: TlsConfig {
-            ca_file: Some("tests/integration/nats/data/rootCA.pem".into()),
-            ..Default::default()
-        },
-    });
     conf.auth = Some(NatsAuthConfig::CredentialsFile {
         credentials_file: NatsAuthCredentialsFile {
             path: "tests/integration/nats/data/nats.creds".into(),
@@ -391,19 +328,12 @@ async fn nats_tls_jwt_auth_valid() {
 }
 
 #[tokio::test]
-async fn nats_tls_jwt_auth_invalid() {
+async fn nats_credentials_file_auth_invalid() {
     let subject = format!("test-{}", random_string(10));
-    let url =
-        std::env::var("NATS_JWT_ADDRESS").unwrap_or_else(|_| String::from("nats://localhost:4222"));
+    let server = start_server!(NatsServer::builder().config(jwt_server_config()));
+    let url = server.client_url().to_owned();
 
     let mut conf = generate_source_config(&url, &subject);
-    conf.tls = Some(TlsEnableableConfig {
-        enabled: Some(true),
-        options: TlsConfig {
-            ca_file: Some("tests/integration/nats/data/rootCA.pem".into()),
-            ..Default::default()
-        },
-    });
     conf.auth = Some(NatsAuthConfig::CredentialsFile {
         credentials_file: NatsAuthCredentialsFile {
             path: "tests/integration/nats/data/nats-bad.creds".into(),
@@ -418,38 +348,10 @@ async fn nats_tls_jwt_auth_invalid() {
 }
 
 #[tokio::test]
-async fn nats_multiple_urls_valid() {
-    let subject = format!("test-{}", random_string(10));
-    let url = "nats://nats:4222,nats://demo.nats.io:4222";
-
-    let conf = generate_source_config(url, &subject);
-
-    let r = publish_and_check(conf).await;
-    assert!(
-        r.is_ok(),
-        "publish_and_check failed for multiple URLs, expected Ok(()), got: {r:?}"
-    );
-}
-
-#[tokio::test]
-async fn nats_multiple_urls_invalid() {
-    let subject = format!("test-{}", random_string(10));
-    let url = "http://invalid-url,nats://:invalid@localhost:4222";
-
-    let conf = generate_source_config(url, &subject);
-
-    let r = publish_and_check(conf).await;
-    assert!(
-        matches!(r, Err(BuildError::Connect { .. })),
-        "publish_and_check failed for bad URLs, expected BuildError::Connect, got: {r:?}"
-    );
-}
-
-#[tokio::test]
 async fn nats_jetstream_valid() {
     let (subject, stream_name, consumer_name) = random_jetstream_id("test_js");
-    let url = std::env::var("NATS_JETSTREAM_ADDRESS")
-        .unwrap_or_else(|_| "nats://localhost:4222".to_string());
+    let server = start_server!(NatsServer::builder().jetstream());
+    let url = server.client_url().to_owned();
 
     let mut conf = generate_source_config(&url, &subject);
     conf.jetstream = Some(JetStreamConfig {
@@ -465,8 +367,8 @@ async fn nats_jetstream_valid() {
 #[tokio::test]
 async fn nats_jetstream_stream_not_found() {
     let subject = format!("test-js-no-stream-{}", random_string(10));
-    let url = std::env::var("NATS_JETSTREAM_ADDRESS")
-        .unwrap_or_else(|_| "nats://localhost:4222".to_string());
+    let server = start_server!(NatsServer::builder().jetstream());
+    let url = server.client_url().to_owned();
 
     let mut conf = generate_source_config(&url, &subject);
     conf.jetstream = Some(JetStreamConfig {
@@ -483,7 +385,10 @@ async fn nats_jetstream_stream_not_found() {
         Ok(_) => panic!("Test failed: expected an error but got Ok"),
         Err(err) => {
             let build_err = err.downcast_ref::<BuildError>().unwrap();
-            assert!(matches!(build_err, BuildError::Stream { .. }));
+            assert!(
+                matches!(build_err, BuildError::Consumer { .. }),
+                "expected BuildError::Consumer, got: {build_err:?}"
+            );
         }
     }
 }
@@ -491,20 +396,12 @@ async fn nats_jetstream_stream_not_found() {
 #[tokio::test]
 async fn nats_jetstream_consumer_not_found() {
     let (subject, stream_name, _consumer_name) = random_jetstream_id("test_js_no_consumer");
-    let url = std::env::var("NATS_JETSTREAM_ADDRESS")
-        .unwrap_or_else(|_| "nats://localhost:4222".to_string());
+    let server = start_server!(NatsServer::builder().jetstream());
+    let url = server.client_url().to_owned();
 
     // Setup: Create the stream but NOT the consumer.
-    let client = async_nats::connect(&url).await.unwrap();
-    let js = async_nats::jetstream::new(client);
-    js.get_or_create_stream(async_nats::jetstream::stream::Config {
-        name: stream_name.clone(),
-        subjects: vec![subject.clone()],
-        storage: StorageType::Memory,
-        ..Default::default()
-    })
-    .await
-    .unwrap();
+    let js = JetstreamClient::new(connect(&url).await);
+    create_stream(&js, &stream_name, &subject).await;
 
     let mut conf = generate_source_config(&url, &subject);
     conf.jetstream = Some(JetStreamConfig {
@@ -521,7 +418,10 @@ async fn nats_jetstream_consumer_not_found() {
         Ok(_) => panic!("Test failed: expected an error but got Ok"),
         Err(err) => {
             let build_err = err.downcast_ref::<BuildError>().unwrap();
-            assert!(matches!(build_err, BuildError::Consumer { .. }));
+            assert!(
+                matches!(build_err, BuildError::ConsumerNotFound { .. }),
+                "expected BuildError::ConsumerNotFound, got: {build_err:?}"
+            );
         }
     }
 }
@@ -532,14 +432,18 @@ async fn nats_shutdown_drain_messages() {
     use tokio::time::{Duration, timeout};
 
     let subject = format!("test-drain-{}", random_string(10));
-    let url =
-        std::env::var("NATS_ADDRESS").unwrap_or_else(|_| String::from("nats://localhost:4222"));
+    let server = start_server!(NatsServer::builder());
+    let url = server.client_url().to_owned();
     let conf = generate_source_config(&url, &subject);
 
     let (shutdown_trigger, shutdown_signal, shutdown_done) = ShutdownSignal::new_wired();
 
     let (nc, sub) = create_subscription(&conf).await.unwrap();
-    let nc_pub = nc.clone();
+    // Messages published by the subscribing client aren't echoed back to it,
+    // so publish them from a separate connection.
+    let nc_pub = conf.connect().await.unwrap();
+    // Make sure the subscription is active before publishing.
+    sync(&nc).await;
     let (tx, mut rx) = SourceSender::new_test();
     let decoder = DecodingConfig::new(
         conf.framing.clone(),
@@ -559,31 +463,19 @@ async fn nats_shutdown_drain_messages() {
         tx,
     ));
 
-    nc_pub
-        .publish(subject.clone(), Bytes::from_static(b"msg1"))
-        .await
-        .unwrap();
-    nc_pub
-        .publish(subject.clone(), Bytes::from_static(b"msg2"))
-        .await
-        .unwrap();
-    nc_pub
-        .publish(subject.clone(), Bytes::from_static(b"msg3"))
-        .await
-        .unwrap();
+    publish(&nc_pub, &subject, b"msg1").await;
+    publish(&nc_pub, &subject, b"msg2").await;
+    publish(&nc_pub, &subject, b"msg3").await;
 
-    // Ensure the messages are sent to the server before we trigger the shutdown
-    nc_pub.flush().await.unwrap();
+    // Ensure the messages are processed by the server before we trigger the shutdown
+    sync(&nc_pub).await;
 
     // Trigger the graceful shutdown
     shutdown_trigger.cancel();
 
     // Publish another message *after* shutdown. This should be ignored by the draining source.
-    nc_pub
-        .publish(subject.clone(), Bytes::from_static(b"ignored"))
-        .await
-        .unwrap();
-    nc_pub.flush().await.unwrap();
+    publish(&nc_pub, &subject, b"ignored").await;
+    sync(&nc_pub).await;
 
     let mut events = Vec::new();
     for _ in 0..3 {
@@ -607,46 +499,30 @@ async fn nats_shutdown_drain_messages() {
 /// Encapsulates NATS JetStream setup (stream, consumer, source) and provides
 /// ergonomic helpers for publish, disruption, and drain-until-found patterns.
 struct JetStreamTestHarness {
-    js: async_nats::jetstream::Context,
+    js: JetstreamClient,
     rx: futures::stream::BoxStream<'static, crate::event::Event>,
     subject: String,
     stream_name: String,
     consumer_name: String,
     _source_handle: tokio::task::JoinHandle<Result<(), ()>>,
+    _server: NatsServer,
 }
 
 impl JetStreamTestHarness {
-    /// Creates a new harness with a fresh stream, consumer, and running source.
-    async fn new() -> Self {
+    /// Creates a new harness with a fresh server, stream, consumer, and running source.
+    ///
+    /// Returns `None` if `nats-server` isn't installed.
+    async fn new() -> Option<Self> {
         use futures::StreamExt;
 
-        let url = std::env::var("NATS_JETSTREAM_ADDRESS")
-            .unwrap_or_else(|_| "nats://localhost:4222".to_string());
+        let server = NatsServer::builder().jetstream().start().await?;
+        let url = server.client_url().to_owned();
 
         let (subject, stream_name, consumer_name) = random_jetstream_id("test_js");
 
-        let client = async_nats::connect(&url)
-            .await
-            .expect("Failed to connect to NATS");
-        let js = async_nats::jetstream::new(client);
-
-        js.get_or_create_stream(async_nats::jetstream::stream::Config {
-            name: stream_name.clone(),
-            subjects: vec![subject.clone()],
-            storage: StorageType::Memory,
-            ..Default::default()
-        })
-        .await
-        .expect("Failed to create stream");
-
-        let stream = js.get_stream(&stream_name).await.unwrap();
-        stream
-            .create_consumer(async_nats::jetstream::consumer::pull::Config {
-                durable_name: Some(consumer_name.clone()),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
+        let js = JetstreamClient::new(connect(&url).await);
+        create_stream(&js, &stream_name, &subject).await;
+        create_consumer(&js, &stream_name, &consumer_name).await;
 
         let conf = NatsSourceConfig {
             url,
@@ -667,24 +543,20 @@ impl JetStreamTestHarness {
         let source = conf.build(cx).await.unwrap();
         let source_handle = tokio::spawn(source);
 
-        Self {
+        Some(Self {
             js,
             rx: rx.boxed(),
             subject,
             stream_name,
             consumer_name,
             _source_handle: source_handle,
-        }
+            _server: server,
+        })
     }
 
     /// Publishes a message and waits for it to be acked by the server.
     async fn publish(&self, payload: &str) {
-        self.js
-            .publish(self.subject.clone(), Bytes::from(payload.to_owned()))
-            .await
-            .unwrap()
-            .await
-            .unwrap();
+        js_publish(&self.js, &self.subject, Bytes::from(payload.to_owned())).await;
     }
 
     /// Publishes a message and asserts it is eventually delivered to the source.
@@ -701,9 +573,8 @@ impl JetStreamTestHarness {
     /// Deletes the durable consumer on the server, invalidating the source's
     /// pull stream. Waits 3 seconds for the pull loop to observe the error.
     async fn delete_consumer(&self) {
-        let stream = self.js.get_stream(&self.stream_name).await.unwrap();
-        stream
-            .delete_consumer(&self.consumer_name)
+        self.js
+            .delete_consumer(&self.stream_name, &self.consumer_name)
             .await
             .expect("Failed to delete consumer");
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -711,37 +582,37 @@ impl JetStreamTestHarness {
 
     /// Recreates the durable consumer so the recovery loop can reconnect.
     async fn recreate_consumer(&self) {
-        let stream = self.js.get_stream(&self.stream_name).await.unwrap();
-        stream
-            .create_consumer(async_nats::jetstream::consumer::pull::Config {
-                durable_name: Some(self.consumer_name.clone()),
-                ..Default::default()
-            })
-            .await
-            .expect("Failed to recreate consumer");
+        create_consumer(&self.js, &self.stream_name, &self.consumer_name).await;
     }
 
     /// Deletes the entire JetStream stream (implicitly deletes all consumers).
     /// Waits 3 seconds for the pull loop to observe the error.
     async fn delete_stream(&self) {
-        self.js
-            .delete_stream(&self.stream_name)
+        let response = self
+            .js
+            .client()
+            .request(
+                format!("$JS.API.STREAM.DELETE.{}", self.stream_name)
+                    .try_into()
+                    .unwrap(),
+            )
+            .payload(Bytes::new())
+            .await
+            .unwrap()
             .await
             .expect("Failed to delete stream");
+        let response: serde_json::Value = serde_json::from_slice(&response.base.payload).unwrap();
+        assert_eq!(
+            response["success"],
+            serde_json::Value::Bool(true),
+            "Failed to delete stream: {response}"
+        );
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     }
 
     /// Recreates both the stream and consumer after a full stream deletion.
     async fn recreate_stream_and_consumer(&self) {
-        self.js
-            .get_or_create_stream(async_nats::jetstream::stream::Config {
-                name: self.stream_name.clone(),
-                subjects: vec![self.subject.clone()],
-                storage: StorageType::Memory,
-                ..Default::default()
-            })
-            .await
-            .expect("Failed to recreate stream");
+        create_stream(&self.js, &self.stream_name, &self.subject).await;
         self.recreate_consumer().await;
     }
 
@@ -778,7 +649,9 @@ impl JetStreamTestHarness {
 /// With the fix, it retries with backoff and resumes delivery.
 #[tokio::test]
 async fn nats_jetstream_stale_consumer_after_close() {
-    let mut h = JetStreamTestHarness::new().await;
+    let Some(mut h) = JetStreamTestHarness::new().await else {
+        return;
+    };
 
     h.publish_and_expect("before-delete").await;
 
@@ -798,7 +671,9 @@ async fn nats_jetstream_stale_consumer_after_close() {
 /// a new message must be delivered, proving the retry loop is re-entrant.
 #[tokio::test]
 async fn nats_jetstream_multiple_recovery_cycles() {
-    let mut h = JetStreamTestHarness::new().await;
+    let Some(mut h) = JetStreamTestHarness::new().await else {
+        return;
+    };
 
     for cycle in 0..2 {
         let label_before = format!("cycle-{cycle}-before");
@@ -831,33 +706,14 @@ async fn nats_jetstream_shutdown_during_recovery() {
         sources::nats::source::{create_consumer_stream, run_nats_jetstream},
     };
 
-    let url = std::env::var("NATS_JETSTREAM_ADDRESS")
-        .unwrap_or_else(|_| "nats://localhost:4222".to_string());
+    let server = start_server!(NatsServer::builder().jetstream());
+    let url = server.client_url().to_owned();
 
     let (subject, stream_name, consumer_name) = random_jetstream_id("test_shutdown");
 
-    let setup_client = async_nats::connect(&url)
-        .await
-        .expect("Failed to connect to NATS for setup");
-    let js = async_nats::jetstream::new(setup_client.clone());
-
-    js.get_or_create_stream(async_nats::jetstream::stream::Config {
-        name: stream_name.clone(),
-        subjects: vec![subject.clone()],
-        storage: StorageType::Memory,
-        ..Default::default()
-    })
-    .await
-    .expect("Failed to create stream");
-
-    let stream = js.get_stream(&stream_name).await.unwrap();
-    stream
-        .create_consumer(async_nats::jetstream::consumer::pull::Config {
-            durable_name: Some(consumer_name.clone()),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
+    let js = JetstreamClient::new(connect(&url).await);
+    create_stream(&js, &stream_name, &subject).await;
+    create_consumer(&js, &stream_name, &consumer_name).await;
 
     let conf = NatsSourceConfig {
         url: url.clone(),
@@ -902,11 +758,7 @@ async fn nats_jetstream_shutdown_during_recovery() {
     ));
 
     // Deliver one message to prove the source is running.
-    js.publish(subject.clone(), Bytes::from_static(b"alive"))
-        .await
-        .unwrap()
-        .await
-        .unwrap();
+    js_publish(&js, &subject, Bytes::from_static(b"alive")).await;
 
     let event = timeout(Duration::from_secs(5), rx.next())
         .await
@@ -918,8 +770,7 @@ async fn nats_jetstream_shutdown_during_recovery() {
     );
 
     // Delete consumer to force the source into the recovery loop.
-    stream
-        .delete_consumer(&consumer_name)
+    js.delete_consumer(&stream_name, &consumer_name)
         .await
         .expect("Failed to delete consumer");
     // Do NOT recreate it — the source should keep retrying.
@@ -960,33 +811,14 @@ async fn nats_jetstream_shutdown_during_consumption() {
         sources::nats::source::{create_consumer_stream, run_nats_jetstream},
     };
 
-    let url = std::env::var("NATS_JETSTREAM_ADDRESS")
-        .unwrap_or_else(|_| "nats://localhost:4222".to_string());
+    let server = start_server!(NatsServer::builder().jetstream());
+    let url = server.client_url().to_owned();
 
     let (subject, stream_name, consumer_name) = random_jetstream_id("test_shutdown_consume");
 
-    let setup_client = async_nats::connect(&url)
-        .await
-        .expect("Failed to connect to NATS for setup");
-    let js = async_nats::jetstream::new(setup_client.clone());
-
-    js.get_or_create_stream(async_nats::jetstream::stream::Config {
-        name: stream_name.clone(),
-        subjects: vec![subject.clone()],
-        storage: StorageType::Memory,
-        ..Default::default()
-    })
-    .await
-    .expect("Failed to create stream");
-
-    let stream = js.get_stream(&stream_name).await.unwrap();
-    stream
-        .create_consumer(async_nats::jetstream::consumer::pull::Config {
-            durable_name: Some(consumer_name.clone()),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
+    let js = JetstreamClient::new(connect(&url).await);
+    create_stream(&js, &stream_name, &subject).await;
+    create_consumer(&js, &stream_name, &consumer_name).await;
 
     let conf = NatsSourceConfig {
         url: url.clone(),
@@ -1031,11 +863,7 @@ async fn nats_jetstream_shutdown_during_consumption() {
     ));
 
     // Deliver one message to prove the source is actively consuming a healthy stream.
-    js.publish(subject.clone(), Bytes::from_static(b"alive"))
-        .await
-        .unwrap()
-        .await
-        .unwrap();
+    js_publish(&js, &subject, Bytes::from_static(b"alive")).await;
 
     let event = timeout(Duration::from_secs(5), rx.next())
         .await
@@ -1073,7 +901,9 @@ async fn nats_jetstream_messages_during_downtime() {
     use futures::StreamExt;
     use tokio::time::{Duration, timeout};
 
-    let mut h = JetStreamTestHarness::new().await;
+    let Some(mut h) = JetStreamTestHarness::new().await else {
+        return;
+    };
 
     h.publish_and_expect("initial").await;
 
@@ -1118,7 +948,9 @@ async fn nats_jetstream_messages_during_downtime() {
 /// instead of `get_consumer`.
 #[tokio::test]
 async fn nats_jetstream_stream_deleted_and_recreated() {
-    let mut h = JetStreamTestHarness::new().await;
+    let Some(mut h) = JetStreamTestHarness::new().await else {
+        return;
+    };
 
     h.publish_and_expect("pre-stream-delete").await;
 
@@ -1139,7 +971,9 @@ async fn nats_jetstream_stream_deleted_and_recreated() {
 /// due to accumulated delay. We enforce a tight timeout on the second cycle.
 #[tokio::test]
 async fn nats_jetstream_backoff_resets_after_recovery() {
-    let mut h = JetStreamTestHarness::new().await;
+    let Some(mut h) = JetStreamTestHarness::new().await else {
+        return;
+    };
 
     // --- First disruption cycle ---
     h.publish_and_expect("round1").await;

@@ -24,9 +24,15 @@ enum NatsError {
     #[snafu(display("NATS Config Error: {}", source))]
     Config { source: NatsConfigError },
     #[snafu(display("NATS Connect Error: {}", source))]
-    Connect { source: async_nats::ConnectError },
-    #[snafu(display("NATS Server Error: {}", source))]
-    ServerError { source: async_nats::Error },
+    Connect {
+        source: watermelon::core::error::ConnectHandlerError,
+    },
+    #[snafu(display("Invalid NATS subject: {}", source))]
+    InvalidSubject {
+        source: watermelon::proto::error::SubjectValidateError,
+    },
     #[snafu(display("NATS Publish Error: {}", source))]
-    PublishError { source: async_nats::Error },
+    PublishError {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }

@@ -1,23 +1,22 @@
 //! Shared helper functions for NATS source and sink.
 #![allow(missing_docs)]
 
-use nkeys::error::Error as NKeysError;
 use snafu::{ResultExt, Snafu};
 use vector_lib::{configurable::configurable_component, sensitive_string::SensitiveString};
-
-use crate::tls::TlsEnableableConfig;
+use watermelon::{
+    core::{AuthenticationMethod, ClientBuilder, error::CredsParseError},
+    proto::{ServerAddr, error::ServerAddrError},
+};
 
 /// Errors that can occur during NATS configuration.
 #[derive(Debug, Snafu)]
 pub enum NatsConfigError {
-    #[snafu(display("NATS Auth Config Error: {}", source))]
-    AuthConfigError { source: NKeysError },
-    #[snafu(display("NATS TLS Config Error: missing key"))]
-    TlsMissingKey,
-    #[snafu(display("NATS TLS Config Error: missing cert"))]
-    TlsMissingCert,
-    #[snafu(display("NATS Credentials file error"))]
+    #[snafu(display("NATS Credentials file error: {}", source))]
     CredentialsFileError { source: std::io::Error },
+    #[snafu(display("NATS Credentials parse error: {}", source))]
+    CredentialsParseError { source: CredsParseError },
+    #[snafu(display("NATS URL parse error: {}", source))]
+    UrlParseError { source: ServerAddrError },
 }
 
 /// Configuration of the authentication strategy when interacting with NATS.
@@ -28,8 +27,7 @@ pub enum NatsConfigError {
     docs::enum_tag_description = "The strategy used to authenticate with the NATS server.
 
 More information on NATS authentication, and the various authentication strategies, can be found in the
-NATS [documentation][nats_auth_docs]. For TLS client certificate authentication specifically, see the
-`tls` settings.
+NATS [documentation][nats_auth_docs].
 
 [nats_auth_docs]: https://docs.nats.io/running-a-nats-service/configuration/securing_nats/auth_intro"
 ))]
@@ -37,16 +35,10 @@ pub enum NatsAuthConfig {
     /// Username/password authentication.
     UserPassword { user_password: NatsAuthUserPassword },
 
-    /// Token authentication.
-    Token { token: NatsAuthToken },
-
     /// Credentials file authentication. (JWT-based)
     CredentialsFile {
         credentials_file: NatsAuthCredentialsFile,
     },
-
-    /// NKey authentication.
-    Nkey { nkey: NatsAuthNKey },
 }
 
 impl std::fmt::Display for NatsAuthConfig {
@@ -54,9 +46,7 @@ impl std::fmt::Display for NatsAuthConfig {
         use NatsAuthConfig::*;
         let word = match self {
             UserPassword { .. } => "user_password",
-            Token { .. } => "token",
             CredentialsFile { .. } => "credentials_file",
-            Nkey { .. } => "nkey",
         };
         write!(f, "{word}")
     }
@@ -74,15 +64,6 @@ pub struct NatsAuthUserPassword {
     pub(crate) password: SensitiveString,
 }
 
-/// Token configuration.
-#[configurable_component]
-#[derive(Clone, Debug)]
-#[serde(deny_unknown_fields)]
-pub struct NatsAuthToken {
-    /// Token.
-    pub(crate) value: SensitiveString,
-}
-
 /// Credentials file configuration.
 #[configurable_component]
 #[derive(Clone, Debug)]
@@ -93,104 +74,44 @@ pub struct NatsAuthCredentialsFile {
     pub(crate) path: String,
 }
 
-/// NKeys configuration.
-#[configurable_component]
-#[derive(Clone, Debug)]
-#[serde(deny_unknown_fields)]
-pub struct NatsAuthNKey {
-    /// User.
-    ///
-    /// Conceptually, this is equivalent to a public key.
-    pub(crate) nkey: String,
-
-    /// Seed.
-    ///
-    /// Conceptually, this is equivalent to a private key.
-    pub(crate) seed: String,
-}
-
 impl NatsAuthConfig {
-    pub(crate) fn to_nats_options(&self) -> Result<async_nats::ConnectOptions, NatsConfigError> {
+    pub(crate) fn to_authentication_method(&self) -> Result<AuthenticationMethod, NatsConfigError> {
         match self {
             NatsAuthConfig::UserPassword { user_password } => {
-                Ok(async_nats::ConnectOptions::with_user_and_password(
-                    user_password.user.clone(),
-                    user_password.password.inner().to_string(),
-                ))
+                Ok(AuthenticationMethod::UserAndPassword {
+                    username: user_password.user.clone(),
+                    password: user_password.password.inner().to_string(),
+                })
             }
             NatsAuthConfig::CredentialsFile { credentials_file } => {
-                async_nats::ConnectOptions::with_credentials(
-                    &std::fs::read_to_string(credentials_file.path.clone())
-                        .context(CredentialsFileSnafu)?,
-                )
-                .context(CredentialsFileSnafu)
+                let contents = std::fs::read_to_string(&credentials_file.path)
+                    .context(CredentialsFileSnafu)?;
+                AuthenticationMethod::from_creds(&contents).context(CredentialsParseSnafu)
             }
-            NatsAuthConfig::Nkey { nkey } => {
-                Ok(async_nats::ConnectOptions::with_nkey(nkey.seed.clone()))
-            }
-            NatsAuthConfig::Token { token } => Ok(async_nats::ConnectOptions::with_token(
-                token.value.inner().to_string(),
-            )),
         }
     }
 }
 
-/// Validate the NATS TLS cert/key pairing without touching the filesystem.
+/// Parse the NATS server URL.
 ///
-/// Mirrors the pairing check in `from_tls_auth_config`.
-pub(crate) fn validate_tls_cert_key_pair(
-    tls_config: &TlsEnableableConfig,
-) -> Result<(), NatsConfigError> {
-    if !tls_config.enabled.unwrap_or(false) {
-        return Ok(());
-    }
-    match (&tls_config.options.crt_file, &tls_config.options.key_file) {
-        (Some(_), None) => Err(NatsConfigError::TlsMissingKey),
-        (None, Some(_)) => Err(NatsConfigError::TlsMissingCert),
-        _ => Ok(()),
-    }
+/// Use the `tls://` scheme to connect using TLS-first, or `nats://` to let the
+/// server decide whether to upgrade the connection to TLS.
+pub(crate) fn parse_server_address(url: &str) -> Result<ServerAddr, NatsConfigError> {
+    url.parse().context(UrlParseSnafu)
 }
 
-pub(crate) fn from_tls_auth_config(
+pub(crate) fn client_builder(
     connection_name: &str,
     auth_config: &Option<NatsAuthConfig>,
-    tls_config: &Option<TlsEnableableConfig>,
-) -> Result<async_nats::ConnectOptions, NatsConfigError> {
-    let nats_options = match &auth_config {
-        None => async_nats::ConnectOptions::new(),
-        Some(auth) => auth.to_nats_options()?,
-    };
+) -> Result<ClientBuilder, NatsConfigError> {
+    let auth_method = auth_config
+        .as_ref()
+        .map(NatsAuthConfig::to_authentication_method)
+        .transpose()?;
 
-    let nats_options = nats_options.name(connection_name);
-
-    match tls_config {
-        None => Ok(nats_options),
-        Some(tls_config) => {
-            let tls_enabled = tls_config.enabled.unwrap_or(false);
-            let nats_options = nats_options.require_tls(tls_enabled);
-            if !tls_enabled {
-                return Ok(nats_options);
-            }
-
-            validate_tls_cert_key_pair(tls_config)?;
-
-            let nats_options = match &tls_config.options.ca_file {
-                None => nats_options,
-                Some(ca_file) => nats_options.add_root_certificates(ca_file.clone()),
-            };
-
-            let nats_options = match (&tls_config.options.crt_file, &tls_config.options.key_file) {
-                (None, None) => nats_options,
-                (Some(crt_file), Some(key_file)) => {
-                    nats_options.add_client_certificate(crt_file.clone(), key_file.clone())
-                }
-                (Some(_), None) | (None, Some(_)) => {
-                    unreachable!("cert/key pairing validated by validate_tls_cert_key_pair")
-                }
-            };
-            Ok(nats_options)
-        }
-    }
+    Ok(ClientBuilder::default()
+        .client_name(connection_name)
+        .authentication_method(auth_method))
 }
 
 #[cfg(test)]
@@ -199,10 +120,12 @@ mod tests {
 
     use super::*;
 
-    fn parse_auth(s: &str) -> Result<async_nats::ConnectOptions, crate::Error> {
+    fn parse_auth(s: &str) -> Result<AuthenticationMethod, crate::Error> {
         serde_yaml::from_str(s)
             .map_err(Into::into)
-            .and_then(|config: NatsAuthConfig| config.to_nats_options().map_err(Into::into))
+            .and_then(|config: NatsAuthConfig| {
+                config.to_authentication_method().map_err(Into::into)
+            })
     }
 
     #[test]
@@ -247,26 +170,6 @@ mod tests {
     }
 
     #[test]
-    fn auth_token_ok() {
-        parse_auth(indoc! {r#"
-            strategy: token
-            token:
-              value: token
-        "#})
-        .unwrap();
-    }
-
-    #[test]
-    fn auth_token_missing() {
-        parse_auth(indoc! {r#"
-            strategy: token
-            user_password:
-              user: foobar
-        "#})
-        .unwrap_err();
-    }
-
-    #[test]
     fn auth_credentials_file_ok() {
         parse_auth(indoc! {r#"
             strategy: credentials_file
@@ -287,43 +190,33 @@ mod tests {
     }
 
     #[test]
-    fn auth_nkey_ok() {
+    fn auth_token_unsupported() {
+        parse_auth(indoc! {r#"
+            strategy: token
+            token:
+              value: token
+        "#})
+        .unwrap_err();
+    }
+
+    #[test]
+    fn auth_nkey_unsupported() {
         parse_auth(indoc! {r#"
             strategy: nkey
             nkey:
               nkey: UC435ZYS52HF72E2VMQF4GO6CUJOCHDUUPEBU7XDXW5AQLIC6JZ46PO5
               seed: SUAAEZYNLTEA2MDTG7L5X7QODZXYHPOI2LT2KH5I4GD6YVP24SE766EGPA
         "#})
-        .unwrap();
-    }
-
-    #[test]
-    fn auth_nkey_missing_nkey() {
-        parse_auth(indoc! {r#"
-            strategy: nkey
-            nkey:
-              seed: SUAAEZYNLTEA2MDTG7L5X7QODZXYHPOI2LT2KH5I4GD6YVP24SE766EGPA
-        "#})
         .unwrap_err();
     }
 
     #[test]
-    fn auth_nkey_missing_seed() {
-        parse_auth(indoc! {r#"
-            strategy: nkey
-            nkey:
-              nkey: UC435ZYS52HF72E2VMQF4GO6CUJOCHDUUPEBU7XDXW5AQLIC6JZ46PO5
-        "#})
-        .unwrap_err();
+    fn server_address_tls_first() {
+        parse_server_address("tls://127.0.0.1:4222").unwrap();
     }
 
     #[test]
-    fn auth_nkey_missing_both() {
-        parse_auth(indoc! {r#"
-            strategy: nkey
-            user_password:
-              user: foobar
-        "#})
-        .unwrap_err();
+    fn server_address_rejects_multiple_urls() {
+        parse_server_address("nats://localhost:4222,nats://localhost:5222").unwrap_err();
     }
 }
