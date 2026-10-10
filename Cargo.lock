@@ -14356,9 +14356,9 @@ dependencies = [
 
 [[package]]
 name = "watermelon"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6f1bada1f539ac96db575bbf80025cb2f8636c6c11e9e5cdf972a89d08028ce2"
+checksum = "e2b2763767043ff2e9a91eeaa5e07909aaeb8b4c387b1433f32a3519c7de1ed1"
 dependencies = [
  "arc-swap",
  "bytes",

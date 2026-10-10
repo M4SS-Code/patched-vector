@@ -463,7 +463,7 @@ lru = { version = "0.18.2", default-features = false }
 maxminddb = { version = "0.27.0", default-features = false, optional = true, features = ["simdutf8"] }
 md-5 = { version = "0.10", default-features = false, optional = true }
 mongodb = { version = "3.7.0", default-features = false, optional = true, features = ["compat-3-0-0", "dns-resolver", "rustls-tls"] }
-watermelon = { version = "0.6.0", default-features = false, optional = true, features = ["ring", "rand", "websocket"] }
+watermelon = { version = "0.6.1", default-features = false, optional = true, features = ["ring", "rand", "websocket"] }
 nom = { workspace = true, optional = true }
 notify = { version = "8.1.0", default-features = false, features = ["macos_fsevent"] }
 openssl = { version = "0.10.73", default-features = false, features = ["vendored"] }

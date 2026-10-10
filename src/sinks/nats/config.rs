@@ -286,17 +286,6 @@ impl NatsPublisher {
             NatsPublisher::JetStream(jetstream) => jetstream.client(),
         };
 
-        // `Client::close` drops the commands that are still queued in the client
-        // and stalls until the connection times out. The server only replies to a
-        // request after having processed every previous publish, so wait for one
-        // to round-trip first. Nobody is expected to respond to it.
-        if let Ok(response) = client
-            .request(Subject::from_static("_VECTOR.flush"))
-            .payload(Bytes::new())
-            .await
-        {
-            drop(response.await);
-        }
         client.close().await;
     }
 
