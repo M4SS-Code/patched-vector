@@ -630,7 +630,7 @@ where
         // really an error, we just wanted to avoid the extra atomic compare/exchange.
         //
         // Basically, this call is actually infallible for our purposes.
-        let result = self.unacked_reader_file_id_offset.fetch_update(
+        let result = self.unacked_reader_file_id_offset.try_update(
             Ordering::Release,
             Ordering::Relaxed,
             |n| {

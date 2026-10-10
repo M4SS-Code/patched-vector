@@ -263,7 +263,7 @@ mod tests {
     use std::{fmt, time::Duration};
 
     use tokio::time;
-    use tokio_test::{assert_pending, assert_ready_err, assert_ready_ok, task};
+    use tokio_test::{assert_pending, assert_ready_ok, task};
     use tower::retry::RetryLayer;
     use tower_test::{assert_request_eq, mock};
 
@@ -320,7 +320,7 @@ mod tests {
 
         let mut fut = task::spawn(svc.call("hello"));
         assert_request_eq!(handle, "hello").send_error(Error(false));
-        assert_ready_err!(fut.poll());
+        assert!(matches!(fut.poll(), Poll::Ready(Err(_))));
     }
 
     #[tokio::test]
@@ -370,7 +370,7 @@ mod tests {
 
         let mut fut = task::spawn(svc.call("hello"));
         assert_request_eq!(handle, "hello").send_error(Elapsed::new());
-        assert_ready_err!(fut.poll());
+        assert!(matches!(fut.poll(), Poll::Ready(Err(_))));
     }
 
     #[test]
