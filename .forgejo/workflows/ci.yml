@@ -5,7 +5,7 @@ on:
   pull_request:
 
 env:
-  RUST_VERSION: 1.99.0
+  RUST_VERSION: 1.99.1
   FEATURES: sources-journald,sources-docker_logs,sources-nats,sources-http_server,transforms-filter,transforms-remap,sinks-nats,sinks-loki,sinks-http,sinks-clickhouse
 
 concurrency:
